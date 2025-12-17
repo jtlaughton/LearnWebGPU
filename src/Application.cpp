@@ -11,7 +11,92 @@
 #include <bits/this_thread_sleep.h>
 #include <iostream>
 
+const char* shaderSource = R"(
+@vertex
+fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> @builtin(position) vec4f {
+	var p = vec2f(0.0, 0.0);
+	if (in_vertex_index == 0u) {
+		p = vec2f(-0.5, -0.5);
+	} else if (in_vertex_index == 1u) {
+		p = vec2f(0.5, -0.5);
+	} else {
+		p = vec2f(0.0, 0.5);
+	}
+	return vec4f(p, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4f {
+	return vec4f(0.0, 0.4, 1.0, 1.0);
+}
+)";
+
 struct DummyUserData {};
+
+void Application::InitializePipeline() {
+	wgpu::ShaderModuleDescriptor shaderDesc;
+
+	wgpu::ShaderSourceWGSL shaderCodeDesc;
+	shaderCodeDesc.nextInChain = nullptr;
+	shaderCodeDesc.sType = wgpu::SType::ShaderSourceWGSL;
+
+	shaderDesc.nextInChain = &shaderCodeDesc;
+	shaderCodeDesc.code = shaderSource;
+	wgpu::ShaderModule shaderModule = device.CreateShaderModule(&shaderDesc);
+
+	wgpu::RenderPipelineDescriptor pipelineDesc;
+
+	pipelineDesc.vertex.bufferCount = 0;
+	pipelineDesc.vertex.buffers = nullptr;
+
+	pipelineDesc.vertex.module = shaderModule;
+	pipelineDesc.vertex.entryPoint = "vs_main";
+	pipelineDesc.vertex.constantCount = 0;
+	pipelineDesc.vertex.constants = nullptr;
+
+	pipelineDesc.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+
+	pipelineDesc.primitive.stripIndexFormat = wgpu::IndexFormat::Undefined;
+
+	pipelineDesc.primitive.frontFace = wgpu::FrontFace::CCW;
+
+	pipelineDesc.primitive.cullMode = wgpu::CullMode::None;
+
+	wgpu::FragmentState fragmentState;
+	fragmentState.module = shaderModule;
+	fragmentState.entryPoint = "fs_main";
+	fragmentState.constantCount = 0;
+	fragmentState.constants = nullptr;
+
+	wgpu::BlendState blendState;
+	blendState.color.srcFactor = wgpu::BlendFactor::SrcAlpha;
+	blendState.color.dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha;
+	blendState.color.operation = wgpu::BlendOperation::Add;
+	blendState.alpha.srcFactor = wgpu::BlendFactor::Zero;
+	blendState.alpha.dstFactor = wgpu::BlendFactor::One;
+	blendState.alpha.operation = wgpu::BlendOperation::Add;
+
+	wgpu::ColorTargetState colorTarget;
+	colorTarget.format = surfaceFormat;
+	colorTarget.blend = &blendState;
+	colorTarget.writeMask = wgpu::ColorWriteMask::All;
+
+	fragmentState.targetCount = 1;
+	fragmentState.targets = &colorTarget;
+	pipelineDesc.fragment = &fragmentState;
+
+	pipelineDesc.depthStencil = nullptr;
+
+	pipelineDesc.multisample.count = 1;
+
+	pipelineDesc.multisample.mask = ~0u;
+
+	pipelineDesc.multisample.alphaToCoverageEnabled = false;
+	pipelineDesc.layout = nullptr;
+
+	pipeline = device.CreateRenderPipeline(&pipelineDesc);
+}
+
 
 bool Application::Initialize() {
 	if (!glfwInit()) {
@@ -88,7 +173,8 @@ bool Application::Initialize() {
 	surfaceConfig.viewFormatCount = 0;
 	surfaceConfig.viewFormats = nullptr;
 	surfaceConfig.device = device;
-	surfaceConfig.format = surfaceCaps.formats[0];  // Use the first supported format
+	surfaceFormat = surfaceCaps.formats[0];  // Use the first supported format
+	surfaceConfig.format = surfaceFormat;
 	surfaceConfig.usage = wgpu::TextureUsage::RenderAttachment;
 	surfaceConfig.width = 640;
 	surfaceConfig.height = 480;
@@ -97,7 +183,89 @@ bool Application::Initialize() {
 
 	surface.Configure(&surfaceConfig);
 
+	InitializePipeline();
+
+	PlayingWithBuffers();
+
 	return true;
+}
+
+void Application::PlayingWithBuffers() {
+	wgpu::BufferDescriptor bufferDesc = {};
+	bufferDesc.label.data = "GPU Side Data Buffer";
+	bufferDesc.label.length = WGPU_STRLEN;
+	bufferDesc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::CopySrc;
+	bufferDesc.size = 16;
+	bufferDesc.mappedAtCreation = false;
+	wgpu::Buffer buffer1 = device.CreateBuffer(&bufferDesc);
+
+	bufferDesc.label.data = "Output Buffer";
+	bufferDesc.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+	wgpu::Buffer buffer2 = device.CreateBuffer(&bufferDesc);
+
+	std::vector<uint8_t> data(16);
+
+	for (uint8_t i = 0; i < 16; ++i) {data[i] = i;}
+
+	queue.WriteBuffer(buffer1, 0, data.data(), data.size());
+
+	wgpu::CommandEncoder encoder = device.CreateCommandEncoder();
+
+	encoder.CopyBufferToBuffer(buffer1, 0, buffer2, 0, 16);
+
+	wgpu::CommandBuffer command = encoder.Finish();
+	queue.Submit(1, &command);
+
+	struct Context {
+		bool ready = false;
+		wgpu::Buffer buffer;
+	};
+
+	auto onBuffer2Mapped = [](WGPUMapAsyncStatus status, WGPUStringView message, void* pUserData1, void* /*unused pointer*/) {
+		Context* context = reinterpret_cast<Context*>(pUserData1);
+		context->ready = true;
+		std::cout << "Buffer 2 mapped with status " << status << " (" << std::string(message.data, message.length) << ")" << std::endl;
+		if (status != WGPUMapAsyncStatus_Success) return;
+
+		auto buffer_data = (uint8_t*)context->buffer.GetConstMappedRange(0, 16);
+
+		std::cout << "bufferData = [";
+		for (int i = 0; i < 16; ++i) {
+			if (i > 0)
+				std::cout << ", ";
+			std::cout << (int)buffer_data[i];
+		}
+		std::cout << "]" << std::endl;
+
+		context->buffer.Unmap();
+	};
+
+	Context context;
+	context.buffer = buffer2;
+
+	WGPUBufferMapCallbackInfo callbackInfo = {};
+	callbackInfo.nextInChain = nullptr;
+	callbackInfo.callback = onBuffer2Mapped;
+	callbackInfo.userdata1 = &context;
+	callbackInfo.userdata2 = nullptr;
+	callbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+
+	wgpuBufferMapAsync(buffer2.Get(), WGPUMapMode_Read, 0, 16, callbackInfo);
+
+	while (!context.ready) {
+		device.Tick();
+	}
+}
+
+wgpu::Limits Application::GetRequiredLimits(wgpu::Adapter adapter) {
+	wgpu::Limits supportedLimits = {};
+	adapter.GetLimits(&supportedLimits);
+
+	wgpu::Limits requiredLimits = wgpu::Default;
+}
+
+void Application::InitializeBuffers() {
+
 }
 
 void Application::Terminate() {
@@ -139,6 +307,10 @@ void Application::MainLoop() {
 
 	// make the render pass? - claude explain
 	wgpu::RenderPassEncoder renderPass = encoder.BeginRenderPass(&renderPassDesc);
+
+	renderPass.SetPipeline(pipeline);
+	renderPass.Draw(3, 1, 0, 0);
+
 	renderPass.End();
 
 	// submit a command finish. Not sure why we need to do this - claude explain
